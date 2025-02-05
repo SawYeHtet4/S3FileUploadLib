@@ -3,6 +3,10 @@ package s3lib
 import (
 	"bytes"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"time"
 
@@ -306,4 +310,117 @@ func (c *S3Client) Close() error {
 	}
 
 	return nil
+}
+
+// PreSignedURLResponse represents the response for pre-signed URL operations
+type PreSignedURLResponse struct {
+	URL     string    `json:"url"`
+	Expires time.Time `json:"expires"`
+}
+
+// PreSignedPostResponse represents the response for pre-signed POST operations
+type PreSignedPostResponse struct {
+	URL    string            `json:"url"`
+	Fields map[string]string `json:"fields"`
+}
+
+// Add this method to your S3Client struct
+func (c *S3Client) GeneratePresignedURL(ctx context.Context, bucket, key string, expires time.Duration, operation string) (*PreSignedURLResponse, error) {
+	if bucket == "" {
+		return nil, ErrInvalidBucket
+	}
+	if key == "" {
+		return nil, ErrInvalidKey
+	}
+
+	var url string
+	var err error
+
+	switch operation {
+	case "upload":
+		req, _ := c.s3Client.PutObjectRequest(&s3.PutObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		url, err = req.Presign(expires)
+
+	case "download":
+		req, _ := c.s3Client.GetObjectRequest(&s3.GetObjectInput{
+			Bucket: aws.String(bucket),
+			Key:    aws.String(key),
+		})
+		url, err = req.Presign(expires)
+
+	default:
+		return nil, fmt.Errorf("invalid operation: %s", operation)
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("failed to generate pre-signed URL: %w", err)
+	}
+
+	return &PreSignedURLResponse{
+		URL:     url,
+		Expires: time.Now().Add(expires),
+	}, nil
+}
+
+// Add this method to your S3Client struct
+func (c *S3Client) GeneratePresignedPost(ctx context.Context, bucket, key string, expires time.Duration, contentLength int64) (*PreSignedPostResponse, error) {
+	if bucket == "" {
+		return nil, ErrInvalidBucket
+	}
+	if key == "" {
+		return nil, ErrInvalidKey
+	}
+
+	// Create policy
+	expiration := time.Now().Add(expires)
+
+	policy := map[string]interface{}{
+		"expiration": expiration.Format(time.RFC3339),
+		"conditions": []interface{}{
+			map[string]string{"bucket": bucket},
+			map[string]string{"key": key},
+		},
+	}
+
+	if contentLength > 0 {
+		policy["conditions"] = append(policy["conditions"].([]interface{}),
+			[]interface{}{"content-length-range", 0, contentLength},
+		)
+	}
+
+	// Convert policy to JSON and base64 encode
+	policyJSON, err := json.Marshal(policy)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal policy: %w", err)
+	}
+	policyBase64 := base64.StdEncoding.EncodeToString(policyJSON)
+
+	// Get credentials and create signature
+	creds, err := c.session.Config.Credentials.Get()
+	if err != nil {
+		return nil, fmt.Errorf("failed to get credentials: %w", err)
+	}
+
+	h := hmac.New(sha256.New, []byte(creds.SecretAccessKey))
+	h.Write([]byte(policyBase64))
+	signature := base64.StdEncoding.EncodeToString(h.Sum(nil))
+
+	// Create form fields
+	fields := map[string]string{
+		"key":            key,
+		"AWSAccessKeyId": creds.AccessKeyID,
+		"policy":         policyBase64,
+		"signature":      signature,
+	}
+
+	// Create POST URL
+	postURL := fmt.Sprintf("https://%s.s3.%s.amazonaws.com", bucket, *c.session.Config.Region)
+
+	return &PreSignedPostResponse{
+		URL:    postURL,
+		Fields: fields,
+	}, nil
 }
